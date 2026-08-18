@@ -266,7 +266,7 @@ const AUTOMATION_UAS = ['headlesschrome','headless','phantomjs','puppeteer','pla
 // Traffic-seller / referral-spam domains, suffix-matched.
 //
 // >>> PASTE SPAM_REFERRER_DOMAINS FROM YOUR v1 FILE HERE, UNCHANGED. <<<
-const SPAM_REFERRER_DOMAINS = [/* ...unchanged from v1... */];
+const SPAM_REFERRER_DOMAINS = ['trafficheap.cc','sparktraffic.com','babylontraffic.com','simpletraffic.co','trafficbot.life','bot-traffic.icu','grets.store','garold.store','razas.site','ofer.bar','semalt.com','darodar.com','buttons-for-website.com','best-seo-offer.com','100dollars-seo.com','free-share-buttons.com','free-social-buttons.com','floating-share-buttons.com','event-tracking.com','get-free-traffic-now.com'];
 
 // UA from request header, falling back to the GA4 client's event user_agent.
 let uaRaw = header('user-agent');
@@ -502,17 +502,10 @@ ___SERVER_PERMISSIONS___
       },
       "param": [
         {
-          "key": "headersAllowed",
-          "value": {
-            "type": 8,
-            "boolean": true
-          }
-        },
-        {
           "key": "requestAccess",
           "value": {
             "type": 1,
-            "string": "specific"
+            "string": "any"
           }
         },
         {
@@ -544,30 +537,10 @@ ___SERVER_PERMISSIONS___
       },
       "param": [
         {
-          "key": "keyPatterns",
-          "value": {
-            "type": 2,
-            "listItem": [
-              {
-                "type": 1,
-                "string": "ip_override"
-              },
-              {
-                "type": 1,
-                "string": "user_agent"
-              },
-              {
-                "type": 1,
-                "string": "page_referrer"
-              }
-            ]
-          }
-        },
-        {
           "key": "eventDataAccess",
           "value": {
             "type": 1,
-            "string": "specific"
+            "string": "any"
           }
         }
       ]
