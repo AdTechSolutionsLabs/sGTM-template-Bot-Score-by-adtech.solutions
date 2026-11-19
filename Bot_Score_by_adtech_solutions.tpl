@@ -16,7 +16,7 @@ ___INFO___
   "categories": [
     "UTILITY"
   ],
-  "description": "v3.0 — server-side bot scoring for sGTM. Recalibrated against real purchase data; adds IP-override spoof detection, in-app WebView exemptions, sec-fetch and screen-size signals.",
+  "description": "v3.2 — server-side bot scoring for sGTM. Calibrated against 3.5 months of GA4 export: malformed-UA signal, ancient-Chromium weight raised, diagnostics output for the next calibration; keeps the v3.1 screen checks and tablet / desktop-site fixes.",
   "containerContexts": [
     "SERVER"
   ],
@@ -53,6 +53,10 @@ ___TEMPLATE_PARAMETERS___
       {
         "value": "classification",
         "displayValue": "Classification (human / suspect / bot)"
+      },
+      {
+        "value": "diagnostics",
+        "displayValue": "Diagnostics (input fingerprint, max 100 chars)"
       }
     ],
     "simpleValueType": true,
@@ -142,6 +146,14 @@ ___TEMPLATE_PARAMETERS___
         "help": "Comma-separated domains to score as referral spam on top of the bundled traffic-seller list (trafficheap.cc, sparktraffic.com, ...). Matched against the page_referrer hostname including subdomains. A match alone meets the default threshold."
       },
       {
+        "type": "TEXT",
+        "name": "suspectScreens",
+        "displayName": "Suspect screen resolutions",
+        "simpleValueType": true,
+        "valueHint": "270x600, 441x896, 428x928, 768x1076",
+        "help": "Comma-separated exact screen_resolution values seen ONLY on bot traffic on this site (check in BigQuery: zero purchases, ~1 session per client_id, ~5 events per session). A match adds the suspect-screen weight (40) — it needs one more signal to reach 70, but blocks alone at a threshold of 40 or below. Validate against purchases before adding a value."
+      },
+      {
         "type": "CHECKBOX",
         "name": "debug",
         "checkboxText": "Log the score and reasons to console (debug/preview only)",
@@ -217,8 +229,13 @@ const W_HINT_CONTRADICTION = 60;  // primary-   — client_hints contradicts the
 const W_IP_OVERRIDE_MISMATCH = 60;// primary-   — GA4 ip_override ≠ edge-set client IP
 const W_HEADLESS = 40;            // high       — automation/library/empty UA
 const W_SCREEN_ZERO = 40;         // high       — 0x0 / 1x1 screen_resolution
+const W_SCREEN_IMPLAUSIBLE = 40;  // high       — no real display: >8192px side or aspect > 3.8
+const W_UA_MALFORMED = 40;        // high       — platform section ends in " )" ("wv" cut out of a WebView UA)
+const W_SUSPECT_SCREEN = 40;      // high       — on the site's own suspect-resolution list
+const W_SCREEN_UA_MISMATCH = 25;  // medium     — iPhone UA on a non-phone screen, Windows UA on a phone screen
 const W_PLATFORM_MISMATCH = 25;   // medium     — sec-ch-ua-platform vs UA OS
 const W_OUTDATED_IOS = 25;        // medium     — implausible iOS major (non-in-app only)
+const W_OUTDATED_BROWSER = 25;    // medium     — Chromium major < 80 (10k users, 0 purchases in calibration)
 const W_MOBILE_MISMATCH = 20;     // medium     — mobile flag vs UA mobile token
 const W_BRAND_MISMATCH = 20;      // medium     — sec-ch-ua brand list is forged
 const W_NO_SEC_FETCH = 15;        // medium     — browser UA, no sec-fetch-mode
@@ -226,7 +243,6 @@ const W_NO_ACCEPT_LANG = 15;      // medium     — browser UA, no accept-langua
 const W_NO_ACCEPT_ENCODING = 15;  // medium     — browser UA, no accept-encoding
 const W_APPLE_NO_OS_TOKEN = 15;   // low+       — iPhone/iPad UA without an OS token
 const W_NO_CLIENT_HINTS = 10;     // low        — non-WebView Chromium UA, no sec-ch-ua
-const W_OUTDATED_BROWSER = 10;    // low        — implausibly old Chromium major
 const W_OUTDATED_ANDROID = 10;    // low        — old Androids genuinely persist
 const W_GEO_OUT_OF_MARKET = 10;   // low (nudge)— datacenter IP outside the market
 const W_GEO_HIGH_RISK = 10;       // low (nudge)— country on the high-risk list
@@ -235,6 +251,10 @@ const CHROMIUM_MIN_MAJOR = 80;
 const IOS_MIN_MAJOR = 16;     // iOS 15 is ~4y stale; <2% live fleet in 2026
 const IOS_MAX_MAJOR = 30;     // sanity ceiling — WebKit build numbers leak into this token
 const ANDROID_MIN_MAJOR = 9;  // old Androids DO persist — hence the low weight
+const SCREEN_MAX_SIDE = 8192;     // CSS px; 8K is 7680x4320 physical, CSS is smaller
+const SCREEN_MAX_ASPECT = 3.8;    // 32:9 super-ultrawide is 3.56; phones top out ~2.5
+const IPHONE_MAX_SHORT_SIDE = 500;// every iPhone to date is <= 440 CSS px wide
+const DESKTOP_MAX_PORTRAIT_WIDTH = 500; // portrait + narrower than this = phone, not a monitor
 
 const GEO_HEADERS = ['cf-ipcountry','x-vercel-ip-country','cloudfront-viewer-country','x-appengine-country','x-geo-country','x-country-code'];
 
@@ -324,9 +344,11 @@ const ua = uaRaw.toLowerCase();
 const outputMode = str(data.outputMode) || 'score';
 const threshold = numOr(data.threshold, 70);
 
+let diag = '';
 const finish = (raw, reasons) => {
   let s = raw; if (s > 100) s = 100; if (s < 0) s = 0;
   log('score=' + s + ' reasons=[' + reasons.join(',') + '] ip=' + clientIp);
+  if (outputMode === 'diagnostics') return diag || (reasons.length ? reasons.join(',') : 'clean');
   if (outputMode === 'reasons') return reasons.length ? reasons.join(',') : 'clean';
   if (outputMode === 'classification') return s >= threshold ? 'bot' : (s > 0 ? 'suspect' : 'human');
   if (outputMode === 'boolean') return s >= threshold;
@@ -368,9 +390,35 @@ if (!ua) add(W_HEADLESS, 'empty-ua');
 else if (containsAny(ua, AUTOMATION_UAS)) add(W_HEADLESS, 'automation-ua');
 if (claimsAiCrawler && !verifiedAiCrawler) add(W_HEADLESS, 'unverified-ai-crawler-ua');
 
+// Malformed platform section: a space right before the first ")", e.g.
+// "(Linux; Android 14; SM-S908U Build/UP1A.231005.007; )". That is what is left
+// when "wv" is cut out of a WebView UA. Calibration: one scraper rotating ~40
+// such UAs produced 176k one-page "users" in 3.5 months with 0 purchases, while
+// 163 real users (5 purchases) shared the shape — so it corroborates (40), it
+// does not decide.
+const uaFirstClose = uaRaw.indexOf(')');
+if (uaFirstClose > 0 && uaRaw.substring(uaFirstClose - 1, uaFirstClose) === ' ') add(W_UA_MALFORMED, 'ua-malformed');
+
 // Screen size: 0x0 / 1x1 is a headless renderer or a scripted payload.
-const sr = lower(str(getEventData('screen_resolution')));
-if (sr === '0x0' || sr === '1x1' || sr === '0x1' || sr === '1x0') add(W_SCREEN_ZERO, 'screen-zero');
+const sr = lower(str(getEventData('screen_resolution'))).split(' ').join('');
+const srParts = sr.split('x');
+const srW = srParts.length === 2 ? makeNumber(srParts[0]) : 0;
+const srH = srParts.length === 2 ? makeNumber(srParts[1]) : 0;
+const srOk = srParts.length === 2 && isNum(srW) && isNum(srH);
+const srShort = srOk ? (srW < srH ? srW : srH) : 0;
+const srLong = srOk ? (srW < srH ? srH : srW) : 0;
+if (srOk && srShort <= 1) {
+  add(W_SCREEN_ZERO, 'screen-zero');
+} else if (srOk && (srLong > SCREEN_MAX_SIDE || srLong / srShort > SCREEN_MAX_ASPECT)) {
+  // Observed: a fingerprint spoofer emitting widths of base x 3^n
+  // (1236 -> 3708 -> 11124 -> ... -> 8109396) at fixed heights; 0 conversions.
+  add(W_SCREEN_IMPLAUSIBLE, 'screen-implausible');
+}
+if (sr) {
+  let suspect = false;
+  lower(str(data.suspectScreens)).split(',').forEach((x) => { if (x.split(' ').join('') === sr) suspect = true; });
+  if (suspect) add(W_SUSPECT_SCREEN, 'suspect-screen');
+}
 
 // Referral spam: hostname of page_referrer suffix-matched against the bundled
 // traffic-seller list plus the user's extras.
@@ -398,6 +446,25 @@ const uaIsApple = ua.indexOf('iphone') !== -1 || ua.indexOf('ipad') !== -1 || ua
 const uaIsWin = ua.indexOf('windows') !== -1;
 const uaIsMac = ua.indexOf('macintosh') !== -1 || ua.indexOf('mac os') !== -1;
 const uaIsAndroid = ua.indexOf('android') !== -1;
+const uaIsIphone = ua.indexOf('iphone') !== -1 || ua.indexOf('ipod') !== -1;
+// "mobile" token only. Android TABLETS send an Android UA WITHOUT "Mobile" and
+// userAgentData.mobile = false, so treating every Android UA as mobile (v3.0)
+// flagged every Android tablet with a mobile mismatch.
+const uaMobileTok = ua.indexOf('mobile') !== -1 || uaIsIphone;
+// Android browsers in desktop-site mode (Chrome, Samsung Internet on tablets /
+// DeX) send an X11/Linux UA while UA-CH can keep reporting mobile = true.
+// Calibration: buyers with this UA shape sat at 30 under v3.0 (mobile mismatch
+// 20 + no-client-hints 10) — real users, not forged UAs.
+const uaIsLinuxDesktop = ua.indexOf('linux') !== -1 && !uaIsAndroid;
+
+// Screen vs UA coherence. Exact screen_resolution is window.screen in CSS px.
+if (srOk && srShort > 1) {
+  if (uaIsIphone && srShort > IPHONE_MAX_SHORT_SIDE) add(W_SCREEN_UA_MISMATCH, 'screen-ua-mismatch');
+  // Windows UA on a portrait, phone-width screen (portrait monitors are
+  // >= 1080 wide). macOS is deliberately NOT checked: iOS Safari "Request
+  // desktop website" sends a Macintosh UA from a real phone-sized screen.
+  else if (uaIsWin && !uaMobileTok && srW < srH && srW < DESKTOP_MAX_PORTRAIT_WIDTH) add(W_SCREEN_UA_MISMATCH, 'screen-ua-mismatch');
+}
 
 // UA-CH presence. Chromium >=89 sends sec-ch-ua on HTTPS — but Android
 // WebViews and many in-app browsers do NOT, and they made up ~half of real
@@ -416,12 +483,15 @@ if (claimsBrowser && !header('accept-language')) add(W_NO_ACCEPT_LANG, 'no-accep
 if (claimsBrowser && !header('accept-encoding')) add(W_NO_ACCEPT_ENCODING, 'no-accept-encoding');
 if (claimsBrowser && !header('sec-fetch-mode')) add(W_NO_SEC_FETCH, 'no-sec-fetch');
 
-// Implausibly old Chromium major version (real fleets auto-update).
+// Implausibly old Chromium major version (real fleets auto-update). Chrome 80
+// is from Feb 2020; calibration found 10k "users" below it and no purchase.
+let uaChromeMajor = 0;
 if (claimsChromium) {
   const k = ua.indexOf('chrome/') !== -1 ? 'chrome/' : (ua.indexOf('chromium/') !== -1 ? 'chromium/' : 'edg/');
   const after = ua.split(k)[1];
   if (after) {
     const major = makeNumber(after.split('.')[0]);
+    if (isNum(major) && major > 0) uaChromeMajor = major;
     if (isNum(major) && major > 0 && major < CHROMIUM_MIN_MAJOR) add(W_OUTDATED_BROWSER, 'outdated-chromium');
   }
 }
@@ -444,6 +514,19 @@ if (hasHints && getType(ch.brands) === 'array') {
 if (hasHints && !chBrands && getType(ch.full_version_list) === 'array') {
   ch.full_version_list.forEach((b) => { if (getType(b) === 'object') chBrands = chBrands + lower(str(b.brand)) + ' '; });
 }
+// Chromium major as the engine itself reports it (diagnostics only for now:
+// a UA whose Chrome/ major differs from this is a rewritten UA string).
+let chChromiumMajor = '';
+const pickChromiumMajor = (list) => {
+  if (getType(list) !== 'array') return;
+  list.forEach((b) => {
+    if (chChromiumMajor || getType(b) !== 'object') return;
+    if (lower(str(b.brand)).indexOf('chromium') === -1) return;
+    const v = getType(b.version) === 'number' ? '' + b.version : str(b.version);
+    chChromiumMajor = v.split('.')[0];
+  });
+};
+if (hasHints) { pickChromiumMajor(ch.full_version_list); pickChromiumMajor(ch.brands); }
 
 if (hasHints) {
   let contradiction = '';
@@ -453,7 +536,7 @@ if (hasHints) {
   // needs one corroborating signal — safe if that ever changes.
   if (uaIsApple) contradiction = 'ios-ua-with-client-hints';
   else if (chPlatform === 'ios' && !uaIsApple) contradiction = 'hint-platform-ios-ua-not';
-  else if (chPlatform === 'android' && !uaIsAndroid) contradiction = 'hint-platform-android-ua-not';
+  else if (chPlatform === 'android' && !uaIsAndroid && !uaIsLinuxDesktop) contradiction = 'hint-platform-android-ua-not';
   else if (chPlatform === 'windows' && !uaIsWin) contradiction = 'hint-platform-windows-ua-not';
   else if (chPlatform === 'macos' && !uaIsMac) contradiction = 'hint-platform-macos-ua-not';
   // Chromium brands present but the UA claims Safari-only.
@@ -462,8 +545,7 @@ if (hasHints) {
   if (contradiction) add(W_HINT_CONTRADICTION, contradiction);
 
   // Mobile flag vs UA token — event-data version, more reliable than the header.
-  if (getType(ch.mobile) === 'boolean') {
-    const uaMobileTok = ua.indexOf('mobile') !== -1 || uaIsAndroid || uaIsApple;
+  if (getType(ch.mobile) === 'boolean' && !uaIsLinuxDesktop) {
     if (ch.mobile !== uaMobileTok) add(W_MOBILE_MISMATCH, 'hint-mobile-mismatch');
   }
 }
@@ -519,17 +601,16 @@ if (!hasHints) {
     let mm = false;
     if (secPlat === 'windows' && !uaIsWin) mm = true;
     else if (secPlat === 'macos' && !uaIsMac) mm = true;
-    else if (secPlat === 'android' && !uaIsAndroid) mm = true;
+    else if (secPlat === 'android' && !uaIsAndroid && !uaIsLinuxDesktop) mm = true;
     else if (secPlat === 'ios' && !uaIsApple) mm = true;
     if (mm) add(W_PLATFORM_MISMATCH, 'platform-mismatch');
   }
 
   if (claimsChromium) {
     const secMobile = lower(getRequestHeader('sec-ch-ua-mobile'));
-    if (secMobile) {
-      const uaMobile = ua.indexOf('mobile') !== -1 || uaIsAndroid || uaIsApple;
-      if (secMobile.indexOf('?1') !== -1 && !uaMobile) add(W_MOBILE_MISMATCH, 'mobile-mismatch');
-      else if (secMobile.indexOf('?0') !== -1 && uaMobile) add(W_MOBILE_MISMATCH, 'mobile-mismatch');
+    if (secMobile && !uaIsLinuxDesktop) {
+      if (secMobile.indexOf('?1') !== -1 && !uaMobileTok) add(W_MOBILE_MISMATCH, 'mobile-mismatch');
+      else if (secMobile.indexOf('?0') !== -1 && uaMobileTok) add(W_MOBILE_MISMATCH, 'mobile-mismatch');
     }
   }
 }
@@ -555,6 +636,34 @@ if (country && country !== 'xx' && country !== 'zz') {
   if (high && geoMatch(high)) add(W_GEO_HIGH_RISK, 'high-risk-country');
   const inMarket = lower(str(data.inMarketRegions));
   if (inMarket && isDatacenter && !geoMatch(inMarket)) add(W_GEO_OUT_OF_MARKET, 'out-of-market-datacenter');
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostics: a compact fingerprint of the inputs (no IP, no full UA) to send
+// as its own GA4 parameter while calibrating. Legend in NOTES.
+// ---------------------------------------------------------------------------
+if (outputMode === 'diagnostics') {
+  const cut = (v, n) => str(v).split(' ').join('').substring(0, n);
+  const sfRaw = lower(header('sec-fetch-mode'));
+  const sf = !sfRaw ? '-' : (sfRaw === 'cors' ? 'c' : (sfRaw === 'no-cors' ? 'n' : (sfRaw === 'same-origin' ? 's' : (sfRaw === 'navigate' ? 'v' : 'o'))));
+  let io = 'na';
+  if (ipo) io = (edgeIp && ipo === edgeIp) ? 'eq' : (ipo === socketIp ? 'sk' : (edgeIp ? 'ne' : 'na'));
+  const ipFam = clientIp.indexOf(':') !== -1 ? '6' : (ipInt >= 0 ? '4' : '-');
+  const hm = (hasHints && getType(ch.mobile) === 'boolean') ? (ch.mobile ? '1' : '0') : '-';
+  diag = ('sr=' + (cut(sr, 14) || '-')
+    + ';p=' + (hasHints ? (cut(chPlatform, 3) || '_') : '-')
+    + ';m=' + hm
+    + ';hv=' + cut(chChromiumMajor, 3)
+    + ';uv=' + (uaChromeMajor ? '' + uaChromeMajor : '')
+    + ';md=' + (hasHints ? (str(ch.model) ? '1' : '0') : '-')
+    + ';su=' + (secChUa ? '1' : '0')
+    + ';sf=' + sf
+    + ';al=' + (cut(lower(header('accept-language')).split(',')[0].split(';')[0], 5) || '-')
+    + ';ul=' + (cut(lower(str(getEventData('language'))), 5) || '-')
+    + ';io=' + io
+    + ';if=' + ipFam
+    + ';cc=' + (cut(country, 2) || '-')
+    + ';ia=' + (isInApp ? '1' : '0')).substring(0, 100);
 }
 
 return finish(score, reasons);
@@ -887,6 +996,108 @@ scenarios:
     mock('getEventData', ev());
     mock('getRequestHeader', chrome({ 'sec-fetch-mode': undefined }));
     assertThat(runCode(mockData)).isEqualTo('suspect');
+- name: Android tablet Chrome (no Mobile token, mobile=false) is NOT a mismatch
+  code: |-
+    mock('getRemoteAddress', () => '84.105.4.12');
+    mock('getEventData', ev({ client_hints: { platform: 'Android', mobile: false, brands: [{brand: 'Chromium', version: '124'}] } }));
+    mock('getRequestHeader', chrome({ 'user-agent': 'Mozilla/5.0 (Linux; Android 14; SM-X710) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36', 'sec-ch-ua-platform': '"Android"' }));
+    assertThat(runCode(mockData)).isEqualTo(0);
+- name: Chrome Android desktop-site mode (Linux UA, Android hints) is NOT a contradiction
+  code: |-
+    mock('getRemoteAddress', () => '84.105.4.12');
+    mock('getEventData', ev({ client_hints: { platform: 'Android', mobile: false, brands: [{brand: 'Chromium', version: '124'}] } }));
+    mock('getRequestHeader', chrome({ 'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36', 'sec-ch-ua-platform': '"Android"' }));
+    assertThat(runCode(mockData)).isEqualTo(0);
+- name: Spoofed width (base x 3^n) scores screen-implausible
+  code: |-
+    mock('getRemoteAddress', () => '84.105.4.12');
+    mock('getEventData', ev({ screen_resolution: '3708x892' }));
+    mock('getRequestHeader', chrome());
+    assertThat(runCode(mockData)).isEqualTo(40);
+- name: 32:9 ultrawide is plausible
+  code: |-
+    mock('getRemoteAddress', () => '84.105.4.12');
+    mock('getEventData', ev({ screen_resolution: '5120x1440' }));
+    mock('getRequestHeader', chrome());
+    assertThat(runCode(mockData)).isEqualTo(0);
+- name: Real phone screen with desktop Chrome UA is a screen-UA mismatch
+  code: |-
+    mock('getRemoteAddress', () => '84.105.4.12');
+    mock('getEventData', ev({ screen_resolution: '390x844' }));
+    mock('getRequestHeader', chrome());
+    assertThat(runCode(mockData)).isEqualTo(25);
+- name: iPhone UA on a desktop-sized screen is a screen-UA mismatch
+  code: |-
+    mock('getRemoteAddress', () => '84.105.4.12');
+    mock('getEventData', ev({ screen_resolution: '1920x1080' }));
+    mock('getRequestHeader', hdr({
+      'user-agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1',
+      'accept-language': 'lt-LT,lt;q=0.9', 'accept-encoding': 'gzip, deflate, br', 'sec-fetch-mode': 'cors'
+    }));
+    assertThat(runCode(mockData)).isEqualTo(25);
+- name: Real iPhone screen with iPhone UA is clean
+  code: |-
+    mock('getRemoteAddress', () => '84.105.4.12');
+    mock('getEventData', ev({ screen_resolution: '393x852' }));
+    mock('getRequestHeader', hdr({
+      'user-agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1',
+      'accept-language': 'lt-LT,lt;q=0.9', 'accept-encoding': 'gzip, deflate, br', 'sec-fetch-mode': 'cors'
+    }));
+    assertThat(runCode(mockData)).isEqualTo(0);
+- name: iOS Safari desktop-website mode (Macintosh UA, phone screen) is clean
+  code: |-
+    mock('getRemoteAddress', () => '84.105.4.12');
+    mock('getEventData', ev({ screen_resolution: '390x844' }));
+    mock('getRequestHeader', hdr({
+      'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15',
+      'accept-language': 'lt-LT,lt;q=0.9', 'accept-encoding': 'gzip, deflate, br', 'sec-fetch-mode': 'cors'
+    }));
+    assertThat(runCode(mockData)).isEqualTo(0);
+- name: Site suspect-screen list is matched
+  code: |-
+    mockData.suspectScreens = '270x600, 441x896';
+    mock('getRemoteAddress', () => '84.105.4.12');
+    mock('getEventData', ev({ screen_resolution: '441x896', client_hints: { platform: 'Android', mobile: true, brands: [{brand: 'Chromium', version: '124'}] } }));
+    mock('getRequestHeader', chrome({ 'user-agent': 'Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36', 'sec-ch-ua-platform': '"Android"', 'sec-ch-ua-mobile': '?1' }));
+    assertThat(runCode(mockData)).isEqualTo(40);
+- name: Malformed platform section ("; )") scores the corroborating weight
+  code: |-
+    mock('getRemoteAddress', () => '84.105.4.12');
+    mock('getEventData', ev());
+    mock('getRequestHeader', chrome({ 'user-agent': 'Mozilla/5.0 (Linux; Android 14; SM-S908U Build/UP1A.231005.007; ) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/126.0.0.0 Mobile Safari/537.36', 'sec-ch-ua-platform': '"Android"', 'sec-ch-ua-mobile': '?1' }));
+    assertThat(runCode(mockData)).isEqualTo(40);
+- name: Observed scraper shape (malformed Android UA + desktop engine hints) crosses 50
+  code: |-
+    mock('getRemoteAddress', () => '84.105.4.12');
+    mock('getEventData', ev({ screen_resolution: '412x915', language: 'en-us', client_hints: { platform: 'Linux', mobile: false, model: '', brands: [{brand: 'Chromium', version: '141'}] } }));
+    mock('getRequestHeader', chrome({ 'user-agent': 'Mozilla/5.0 (Linux; Android 11; SM-N981U Build/RP1A.200720.012; ) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/126.0.0.0 Mobile Safari/537.36', 'sec-ch-ua-platform': '"Linux"' }));
+    assertThat(runCode(mockData)).isEqualTo(60);
+- name: Ancient Chromium (<80) scores the medium weight
+  code: |-
+    mock('getRemoteAddress', () => '84.105.4.12');
+    mock('getEventData', ev());
+    mock('getRequestHeader', chrome({ 'user-agent': 'Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/45.0.2454.85 Safari/537.36' }));
+    assertThat(runCode(mockData)).isEqualTo(25);
+- name: DevTools device descriptor with an ancient Chrome and desktop hints is over 50
+  code: |-
+    mock('getRemoteAddress', () => '84.105.4.12');
+    mock('getEventData', ev({ client_hints: { platform: 'Linux', mobile: false, brands: [{brand: 'Chromium', version: '141'}] } }));
+    mock('getRequestHeader', chrome({ 'user-agent': 'Mozilla/5.0 (Linux; Android 8.0; Pixel 2 Build/OPD3.170816.012) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/45.0.2454.95 Mobile Safari/537.36', 'sec-ch-ua': undefined, 'sec-ch-ua-platform': undefined, 'sec-ch-ua-mobile': undefined }));
+    assertThat(runCode(mockData)).isEqualTo(65);
+- name: Diagnostics mode returns the input fingerprint
+  code: |-
+    mockData.outputMode = 'diagnostics';
+    mock('getRemoteAddress', () => '10.0.0.2');
+    mock('getEventData', ev({ screen_resolution: '412x915', language: 'en-us', ip_override: '84.105.4.12', client_hints: { platform: 'Linux', mobile: false, model: '', brands: [{brand: 'Chromium', version: '141'}] } }));
+    mock('getRequestHeader', chrome({ 'cf-connecting-ip': '84.105.4.12', 'cf-ipcountry': 'LV', 'sec-fetch-mode': 'no-cors', 'user-agent': 'Mozilla/5.0 (Linux; Android 11; SM-N981U Build/RP1A.200720.012; ) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/126.0.0.0 Mobile Safari/537.36' }));
+    assertThat(runCode(mockData)).isEqualTo('sr=412x915;p=lin;m=0;hv=141;uv=126;md=0;su=1;sf=n;al=en-us;ul=en-us;io=eq;if=4;cc=lv;ia=0');
+- name: Diagnostics mode without client hints
+  code: |-
+    mockData.outputMode = 'diagnostics';
+    mock('getRemoteAddress', () => '84.105.4.12');
+    mock('getEventData', ev());
+    mock('getRequestHeader', chrome());
+    assertThat(runCode(mockData)).isEqualTo('sr=-;p=-;m=-;hv=;uv=124;md=-;su=1;sf=c;al=en-us;ul=-;io=na;if=4;cc=-;ia=0');
 setup: |-
   const mockData = {
     outputMode: 'score',
@@ -897,6 +1108,7 @@ setup: |-
     geoHeader: '',
     inMarketRegions: '',
     highRiskRegions: '',
+    suspectScreens: '',
     debug: false
   };
   const CHROME_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
@@ -951,18 +1163,32 @@ ROLLOUT — SHADOW MODE, THEN VALIDATE AGAINST REVENUE
      scored above 25 — which is why the threshold stays at 70 and that weight
      was cut. Do this check again after any weight change and on every new
      site; in-app / WebView share differs a lot between markets.
-  3. Only then add the blocking-trigger exception.
+  3. Only then add the blocking-trigger exception. Block with ">= threshold":
+     a hit scoring exactly the threshold is a bot.
+
+     v3.2 calibration (same retailer, GA4 export Aug-Nov 2026): of ~23k
+     purchases recorded while nothing was blocked, none scored >= 50; purchases
+     at 20/30 were Android tablets and desktop-site mode (the v3.1 fixes); a UA
+     whose platform section ends in " )" covered 176k one-page "users" with 5
+     purchases (all from 163 users at score 0); Chromium < 80 covered 10k
+     "users" with 0 purchases. On that site 50 is a safe threshold; elsewhere
+     keep 70 until the same check is done.
 
 SIGNALS & WEIGHTS (see the W_* constants)
   Decisive alone (70): datacenter IP, spam referrer.
   Near-decisive (60): client_hints contradicting the UA; GA4 ip_override
     disagreeing with the edge-set client IP.
-  Corroborating (40): automation / empty UA; 0x0 screen.
-  Medium (15–25): platform / mobile / brand mismatch; implausible iOS version
+  Corroborating (40): automation / empty UA; 0x0 screen; implausible screen
+    (>8192 px or aspect > 3.8); site suspect-screen list; malformed UA
+    platform section (" )").
+  Medium (15–25): platform / mobile / brand mismatch; screen vs UA mismatch;
+    Chromium older than 80; implausible iOS version
     on a NON-in-app UA; missing accept-language / accept-encoding /
     sec-fetch-mode; iPhone UA with no OS token.
-  Low (10): non-WebView Chromium without client hints; outdated Chromium /
-    Android; geo nudges.
+  Low (10): non-WebView Chromium without client hints; outdated Android; geo
+    nudges. Note: where the Google tag sends hits through its service worker,
+    real Chrome arrives without sec-ch-ua, so "chromium-no-client-hints" can
+    sit on a large share of genuine purchases — it is noise there, keep it low.
   A clean residential browser scores 0. A residential IP must fail several
   independent integrity checks at once to cross 70.
 
@@ -1012,6 +1238,38 @@ SPAM REFERRERS
   count. These domains churn — extend per container via "Extra spam referrer
   domains" and fold recurring ones back into the bundled list.
 
+DIAGNOSTICS MODE (calibration aid)
+  Output "Diagnostics" returns a <=100-char fingerprint of what the variable
+  saw, so the next weight change is validated in BigQuery instead of guessed.
+  Send it as its own GA4 event parameter (e.g. bot_diag) next to a
+  reasons-mode variable (bot_reasons); drop both once calibrated.
+    sr  screen_resolution as received
+    p   client_hints.platform, first 3 letters (and/win/mac/lin/ios/chr);
+        "_" = hints present but platform blank; "-" = no client_hints
+    m   client_hints.mobile (1/0), "-" if absent
+    hv  Chromium major from client_hints brands
+    uv  Chrome major from the UA string (hv != uv means a rewritten UA)
+    md  client_hints.model present (1/0)
+    su  sec-ch-ua request header present (1/0)
+    sf  sec-fetch-mode: c cors, n no-cors, s same-origin, v navigate, - none
+    al  accept-language header, first tag (compare with ul)
+    ul  GA4 language (navigator.language)
+    io  ip_override vs trusted edge IP: eq / ne / sk (socket peer) / na
+    if  client IP family: 4 / 6
+    cc  edge country
+    ia  in-app / WebView UA (1/0)
+  It carries no IP address and no full UA. Example — fingerprints that never buy:
+
+       SELECT REGEXP_EXTRACT(d, r'p=([^;]*)') AS p, REGEXP_EXTRACT(d, r'm=([^;]*)') AS m,
+              REGEXP_EXTRACT(d, r'hv=([^;]*)') = REGEXP_EXTRACT(d, r'uv=([^;]*)') AS ver_match,
+              COUNT(DISTINCT user_pseudo_id) AS users,
+              COUNTIF(event_name = 'purchase') AS purchases
+       FROM (SELECT *, (SELECT value.string_value FROM UNNEST(event_params)
+                        WHERE key = 'bot_diag') AS d
+             FROM `project.analytics_XXX.events_*`
+             WHERE _TABLE_SUFFIX BETWEEN ... AND ...)
+       GROUP BY 1, 2, 3 ORDER BY users DESC;
+
 WHAT THIS CANNOT SEE
   - Hits sent straight to Google's /g/collect with your public measurement
     ID never pass through sGTM and are never scored. Only a server-side-only
@@ -1038,6 +1296,14 @@ PERMISSIONS
   canonical permission block before deploying.
 
 CHANGELOG
+  v3.2  calibrated on 3.5 months of GA4 export: ua-malformed (40) for a
+        platform section ending in " )"; outdated-chromium (<80) 10→25;
+        diagnostics output mode; block at ">= threshold"; 50 tests.
+  v3.1  screen-implausible (40): >8192 px side or aspect > 3.8 (caught a
+        base x 3^n width spoofer); screen-ua-mismatch (25); site-level
+        suspect-screen list (40); fixed mobile-mismatch on Android tablets
+        (Android UA without "Mobile"); exempted Chrome Android desktop-site
+        mode from platform/mobile contradictions; 44 tests.
   v3.0  recalibrated against purchase data; in-app/WebView exemptions;
         ip_override spoof detection; trusted-IP-header config; sec-fetch and
         screen-size signals; iOS+hints 70→60; no-client-hints 25→10;
