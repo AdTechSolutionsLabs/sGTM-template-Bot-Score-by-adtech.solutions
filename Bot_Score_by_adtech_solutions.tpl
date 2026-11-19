@@ -996,25 +996,25 @@ scenarios:
     mock('getEventData', ev());
     mock('getRequestHeader', chrome({ 'sec-fetch-mode': undefined }));
     assertThat(runCode(mockData)).isEqualTo('suspect');
-- name: Android tablet Chrome (no Mobile token, mobile=false) is NOT a mismatch
+- name: Android tablet Chrome without a Mobile token is NOT a mismatch
   code: |-
     mock('getRemoteAddress', () => '84.105.4.12');
     mock('getEventData', ev({ client_hints: { platform: 'Android', mobile: false, brands: [{brand: 'Chromium', version: '124'}] } }));
     mock('getRequestHeader', chrome({ 'user-agent': 'Mozilla/5.0 (Linux; Android 14; SM-X710) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36', 'sec-ch-ua-platform': '"Android"' }));
     assertThat(runCode(mockData)).isEqualTo(0);
-- name: Chrome Android desktop-site mode (Linux UA, Android hints) is NOT a contradiction
+- name: Android desktop-site mode (Linux UA with Android hints) is NOT flagged
   code: |-
     mock('getRemoteAddress', () => '84.105.4.12');
     mock('getEventData', ev({ client_hints: { platform: 'Android', mobile: false, brands: [{brand: 'Chromium', version: '124'}] } }));
     mock('getRequestHeader', chrome({ 'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36', 'sec-ch-ua-platform': '"Android"' }));
     assertThat(runCode(mockData)).isEqualTo(0);
-- name: Spoofed width (base x 3^n) scores screen-implausible
+- name: Spoofed screen width (base times a power of 3) scores screen-implausible
   code: |-
     mock('getRemoteAddress', () => '84.105.4.12');
     mock('getEventData', ev({ screen_resolution: '3708x892' }));
     mock('getRequestHeader', chrome());
     assertThat(runCode(mockData)).isEqualTo(40);
-- name: 32:9 ultrawide is plausible
+- name: A 32 by 9 ultrawide screen is plausible
   code: |-
     mock('getRemoteAddress', () => '84.105.4.12');
     mock('getEventData', ev({ screen_resolution: '5120x1440' }));
@@ -1044,7 +1044,7 @@ scenarios:
       'accept-language': 'lt-LT,lt;q=0.9', 'accept-encoding': 'gzip, deflate, br', 'sec-fetch-mode': 'cors'
     }));
     assertThat(runCode(mockData)).isEqualTo(0);
-- name: iOS Safari desktop-website mode (Macintosh UA, phone screen) is clean
+- name: iOS Safari desktop-website mode (Macintosh UA on a phone screen) is clean
   code: |-
     mock('getRemoteAddress', () => '84.105.4.12');
     mock('getEventData', ev({ screen_resolution: '390x844' }));
@@ -1060,25 +1060,25 @@ scenarios:
     mock('getEventData', ev({ screen_resolution: '441x896', client_hints: { platform: 'Android', mobile: true, brands: [{brand: 'Chromium', version: '124'}] } }));
     mock('getRequestHeader', chrome({ 'user-agent': 'Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36', 'sec-ch-ua-platform': '"Android"', 'sec-ch-ua-mobile': '?1' }));
     assertThat(runCode(mockData)).isEqualTo(40);
-- name: Malformed platform section ("; )") scores the corroborating weight
+- name: Malformed UA platform section scores the corroborating weight
   code: |-
     mock('getRemoteAddress', () => '84.105.4.12');
     mock('getEventData', ev());
     mock('getRequestHeader', chrome({ 'user-agent': 'Mozilla/5.0 (Linux; Android 14; SM-S908U Build/UP1A.231005.007; ) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/126.0.0.0 Mobile Safari/537.36', 'sec-ch-ua-platform': '"Android"', 'sec-ch-ua-mobile': '?1' }));
     assertThat(runCode(mockData)).isEqualTo(40);
-- name: Observed scraper shape (malformed Android UA + desktop engine hints) crosses 50
+- name: Scraper shape (malformed Android UA with desktop hints) crosses 50
   code: |-
     mock('getRemoteAddress', () => '84.105.4.12');
     mock('getEventData', ev({ screen_resolution: '412x915', language: 'en-us', client_hints: { platform: 'Linux', mobile: false, model: '', brands: [{brand: 'Chromium', version: '141'}] } }));
     mock('getRequestHeader', chrome({ 'user-agent': 'Mozilla/5.0 (Linux; Android 11; SM-N981U Build/RP1A.200720.012; ) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/126.0.0.0 Mobile Safari/537.36', 'sec-ch-ua-platform': '"Linux"' }));
     assertThat(runCode(mockData)).isEqualTo(60);
-- name: Ancient Chromium (<80) scores the medium weight
+- name: Ancient Chromium (below 80) scores the medium weight
   code: |-
     mock('getRemoteAddress', () => '84.105.4.12');
     mock('getEventData', ev());
     mock('getRequestHeader', chrome({ 'user-agent': 'Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/45.0.2454.85 Safari/537.36' }));
     assertThat(runCode(mockData)).isEqualTo(25);
-- name: DevTools device descriptor with an ancient Chrome and desktop hints is over 50
+- name: DevTools device UA with an ancient Chrome and desktop hints is over 50
   code: |-
     mock('getRemoteAddress', () => '84.105.4.12');
     mock('getEventData', ev({ client_hints: { platform: 'Linux', mobile: false, brands: [{brand: 'Chromium', version: '141'}] } }));
