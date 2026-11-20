@@ -16,7 +16,7 @@ ___INFO___
   "categories": [
     "UTILITY"
   ],
-  "description": "v3.2 — server-side bot scoring for sGTM. Calibrated against 3.5 months of GA4 export: malformed-UA signal, ancient-Chromium weight raised, diagnostics output for the next calibration; keeps the v3.1 screen checks and tablet / desktop-site fixes.",
+  "description": "v3.2.1 — server-side bot scoring for sGTM. Calibrated against 3.5 months of GA4 export: malformed-UA signal, diagnostics output for the next calibration; keeps the v3.1 screen checks and tablet / desktop-site fixes.",
   "containerContexts": [
     "SERVER"
   ],
@@ -235,7 +235,6 @@ const W_SUSPECT_SCREEN = 40;      // high       — on the site's own suspect-re
 const W_SCREEN_UA_MISMATCH = 25;  // medium     — iPhone UA on a non-phone screen, Windows UA on a phone screen
 const W_PLATFORM_MISMATCH = 25;   // medium     — sec-ch-ua-platform vs UA OS
 const W_OUTDATED_IOS = 25;        // medium     — implausible iOS major (non-in-app only)
-const W_OUTDATED_BROWSER = 25;    // medium     — Chromium major < 80 (10k users, 0 purchases in calibration)
 const W_MOBILE_MISMATCH = 20;     // medium     — mobile flag vs UA mobile token
 const W_BRAND_MISMATCH = 20;      // medium     — sec-ch-ua brand list is forged
 const W_NO_SEC_FETCH = 15;        // medium     — browser UA, no sec-fetch-mode
@@ -243,6 +242,7 @@ const W_NO_ACCEPT_LANG = 15;      // medium     — browser UA, no accept-langua
 const W_NO_ACCEPT_ENCODING = 15;  // medium     — browser UA, no accept-encoding
 const W_APPLE_NO_OS_TOKEN = 15;   // low+       — iPhone/iPad UA without an OS token
 const W_NO_CLIENT_HINTS = 10;     // low        — non-WebView Chromium UA, no sec-ch-ua
+const W_OUTDATED_BROWSER = 10;    // low        — Chromium major < 80; keep low, see the note at the check
 const W_OUTDATED_ANDROID = 10;    // low        — old Androids genuinely persist
 const W_GEO_OUT_OF_MARKET = 10;   // low (nudge)— datacenter IP outside the market
 const W_GEO_HIGH_RISK = 10;       // low (nudge)— country on the high-risk list
@@ -483,8 +483,10 @@ if (claimsBrowser && !header('accept-language')) add(W_NO_ACCEPT_LANG, 'no-accep
 if (claimsBrowser && !header('accept-encoding')) add(W_NO_ACCEPT_ENCODING, 'no-accept-encoding');
 if (claimsBrowser && !header('sec-fetch-mode')) add(W_NO_SEC_FETCH, 'no-sec-fetch');
 
-// Implausibly old Chromium major version (real fleets auto-update). Chrome 80
-// is from Feb 2020; calibration found 10k "users" below it and no purchase.
+// Implausibly old Chromium major version (real fleets auto-update). Keep the
+// weight LOW: real phones stuck on Chrome 61-79 cores (old Xiaomi / Sony
+// browsers) also lack sec-fetch (15) and client hints (10), so at 25 they land
+// on exactly 50 (seen live within a day of trying it); at 10 they stay at 35.
 let uaChromeMajor = 0;
 if (claimsChromium) {
   const k = ua.indexOf('chrome/') !== -1 ? 'chrome/' : (ua.indexOf('chromium/') !== -1 ? 'chromium/' : 'edg/');
@@ -1072,18 +1074,27 @@ scenarios:
     mock('getEventData', ev({ screen_resolution: '412x915', language: 'en-us', client_hints: { platform: 'Linux', mobile: false, model: '', brands: [{brand: 'Chromium', version: '141'}] } }));
     mock('getRequestHeader', chrome({ 'user-agent': 'Mozilla/5.0 (Linux; Android 11; SM-N981U Build/RP1A.200720.012; ) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/126.0.0.0 Mobile Safari/537.36', 'sec-ch-ua-platform': '"Linux"' }));
     assertThat(runCode(mockData)).isEqualTo(60);
-- name: Ancient Chromium (below 80) scores the medium weight
+- name: Ancient Chromium (below 80) scores only the low weight
   code: |-
     mock('getRemoteAddress', () => '84.105.4.12');
     mock('getEventData', ev());
     mock('getRequestHeader', chrome({ 'user-agent': 'Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/45.0.2454.85 Safari/537.36' }));
-    assertThat(runCode(mockData)).isEqualTo(25);
-- name: DevTools device UA with an ancient Chrome and desktop hints is over 50
+    assertThat(runCode(mockData)).isEqualTo(10);
+- name: DevTools device UA with an ancient Chrome and desktop hints reaches 50
   code: |-
     mock('getRemoteAddress', () => '84.105.4.12');
     mock('getEventData', ev({ client_hints: { platform: 'Linux', mobile: false, brands: [{brand: 'Chromium', version: '141'}] } }));
     mock('getRequestHeader', chrome({ 'user-agent': 'Mozilla/5.0 (Linux; Android 8.0; Pixel 2 Build/OPD3.170816.012) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/45.0.2454.95 Mobile Safari/537.36', 'sec-ch-ua': undefined, 'sec-ch-ua-platform': undefined, 'sec-ch-ua-mobile': undefined }));
-    assertThat(runCode(mockData)).isEqualTo(65);
+    assertThat(runCode(mockData)).isEqualTo(50);
+- name: Old phone browser on a Chrome 71 core without sec-fetch stays below 50
+  code: |-
+    mock('getRemoteAddress', () => '84.105.4.12');
+    mock('getEventData', ev());
+    mock('getRequestHeader', hdr({
+      'user-agent': 'Mozilla/5.0 (Linux; U; Android 9; lt-lt; Redmi Note 8T Build/PKQ1.190616.001) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/71.0.3578.141 Mobile Safari/537.36 XiaoMi/MiuiBrowser/12.10.5-gn',
+      'accept-language': 'lt-LT,lt;q=0.9', 'accept-encoding': 'gzip, deflate'
+    }));
+    assertThat(runCode(mockData)).isEqualTo(35);
 - name: Diagnostics mode returns the input fingerprint
   code: |-
     mockData.outputMode = 'diagnostics';
@@ -1170,9 +1181,13 @@ ROLLOUT — SHADOW MODE, THEN VALIDATE AGAINST REVENUE
      purchases recorded while nothing was blocked, none scored >= 50; purchases
      at 20/30 were Android tablets and desktop-site mode (the v3.1 fixes); a UA
      whose platform section ends in " )" covered 176k one-page "users" with 5
-     purchases (all from 163 users at score 0); Chromium < 80 covered 10k
-     "users" with 0 purchases. On that site 50 is a safe threshold; elsewhere
-     keep 70 until the same check is done.
+     purchases (all from 163 users at score 0). On that site 50 is a safe
+     threshold; elsewhere keep 70 until the same check is done.
+     Lesson from v3.2: "0 purchases in the band" is not enough to raise a
+     weight. Chromium < 80 had 0 purchases in 10k "users", but at 25 it put
+     real old phones (Chrome 61-79 cores, lt-lt, multi-page sessions) on
+     exactly 50 within a day. Check which real combinations a new weight
+     creates, not only the band it was measured on.
 
 SIGNALS & WEIGHTS (see the W_* constants)
   Decisive alone (70): datacenter IP, spam referrer.
@@ -1182,11 +1197,11 @@ SIGNALS & WEIGHTS (see the W_* constants)
     (>8192 px or aspect > 3.8); site suspect-screen list; malformed UA
     platform section (" )").
   Medium (15–25): platform / mobile / brand mismatch; screen vs UA mismatch;
-    Chromium older than 80; implausible iOS version
+    implausible iOS version
     on a NON-in-app UA; missing accept-language / accept-encoding /
     sec-fetch-mode; iPhone UA with no OS token.
-  Low (10): non-WebView Chromium without client hints; outdated Android; geo
-    nudges. Note: where the Google tag sends hits through its service worker,
+  Low (10): non-WebView Chromium without client hints; outdated Chromium /
+    Android; geo nudges. Note: where the Google tag sends hits through its service worker,
     real Chrome arrives without sec-ch-ua, so "chromium-no-client-hints" can
     sit on a large share of genuine purchases — it is noise there, keep it low.
   A clean residential browser scores 0. A residential IP must fail several
@@ -1296,6 +1311,8 @@ PERMISSIONS
   canonical permission block before deploying.
 
 CHANGELOG
+  v3.2.1 outdated-chromium back to 10 (25 put real old phones on exactly 50);
+        51 tests.
   v3.2  calibrated on 3.5 months of GA4 export: ua-malformed (40) for a
         platform section ending in " )"; outdated-chromium (<80) 10→25;
         diagnostics output mode; block at ">= threshold"; 50 tests.
